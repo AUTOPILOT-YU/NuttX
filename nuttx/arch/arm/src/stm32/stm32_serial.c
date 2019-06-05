@@ -180,7 +180,12 @@
  * everytime the FIFO receives half this number of bytes.
  */
 
+#if defined(CONFIG_STM32_RXDMA_BUFFER_SIZE_OVERRIDE)
+#  define RXDMA_BUFFER_SIZE   CONFIG_STM32_RXDMA_BUFFER_SIZE_OVERRIDE
+#else
 #  define RXDMA_BUFFER_SIZE   32
+#endif
+
 
 /* DMA priority */
 
@@ -310,6 +315,15 @@ struct up_dev_s
 #endif
 };
 
+/*
+   Current STM32s have broken hw based RTS behavior (they assert nRTS after every byte received)
+   To work around this the following define turns on software based management of RTS.  The
+   software solution drives nRTS based on the # of free bytes in the nuttx rx buffer
+*/
+#ifdef CONFIG_SERIAL_IFLOWCONTROL
+#define HWRTS_BROKEN 1
+#endif
+
 /****************************************************************************
  * Private Function Prototypes
  ****************************************************************************/
@@ -329,6 +343,7 @@ static bool up_rxavailable(struct uart_dev_s *dev);
 static void up_send(struct uart_dev_s *dev, int ch);
 static void up_txint(struct uart_dev_s *dev, bool enable);
 static bool up_txready(struct uart_dev_s *dev);
+static void up_recvchars(struct up_dev_s *priv);
 
 #ifdef SERIAL_HAVE_DMA
 static int  up_dma_setup(struct uart_dev_s *dev);
@@ -338,6 +353,10 @@ static void up_dma_rxint(struct uart_dev_s *dev, bool enable);
 static bool up_dma_rxavailable(struct uart_dev_s *dev);
 
 static void up_dma_rxcallback(DMA_HANDLE handle, uint8_t status, void *arg);
+#endif
+
+#ifdef HWRTS_BROKEN
+static void up_onrxdeque(struct uart_dev_s *dev);
 #endif
 
 #ifdef CONFIG_PM
@@ -389,6 +408,9 @@ static const struct uart_ops_s g_uart_ops =
   .txint          = up_txint,
   .txready        = up_txready,
   .txempty        = up_txready,
+#ifdef HWRTS_BROKEN
+  .onrxdeque      = up_onrxdeque,
+#endif
 };
 #endif
 
@@ -407,6 +429,9 @@ static const struct uart_ops_s g_uart_dma_ops =
   .txint          = up_txint,
   .txready        = up_txready,
   .txempty        = up_txready,
+#ifdef HWRTS_BROKEN
+  .onrxdeque      = up_onrxdeque,
+#endif
 };
 #endif
 
@@ -1155,6 +1180,7 @@ static void up_set_format(struct uart_dev_s *dev)
 {
   struct up_dev_s *priv = (struct up_dev_s*)dev->priv;
   uint32_t regval;
+  uint32_t cr1;
 
 #ifdef CONFIG_STM32_STM32F30XX
   /* This first implementation is for U[S]ARTs that support oversampling
@@ -1162,7 +1188,6 @@ static void up_set_format(struct uart_dev_s *dev)
    */
 
   uint32_t usartdiv8;
-  uint32_t cr1;
   uint32_t brr;
 
   /* In case of oversampling by 8, the equation is:
@@ -1221,6 +1246,9 @@ static void up_set_format(struct uart_dev_s *dev)
   uint32_t fraction;
   uint32_t brr;
 
+  /* Load CR1 */
+  cr1 = up_serialin(priv, STM32_USART_CR1_OFFSET);
+
   /* Configure the USART Baud Rate.  The baud rate for the receiver and
    * transmitter (Rx and Tx) are both set to the same value as programmed
    * in the Mantissa and Fraction values of USARTDIV.
@@ -1242,30 +1270,65 @@ static void up_set_format(struct uart_dev_s *dev)
    /* The mantissa part is then */
 
    mantissa   = usartdiv32 >> 5;
-   brr        = mantissa << USART_BRR_MANT_SHIFT;
 
    /* The fractional remainder (with rounding) */
 
    fraction   = (usartdiv32 - (mantissa << 5) + 1) >> 1;
+
+#if defined(CONFIG_STM32_STM32F40XX)
+   /* Check if 8x oversampling is necessary */
+   if (mantissa == 0)
+     {
+       cr1 |= USART_CR1_OVER8;
+       /* Rescale the mantissa */
+
+       mantissa = usartdiv32 >> 4;
+
+       /* The fractional remainder (with rounding) */
+
+       fraction = (usartdiv32 - (mantissa << 4) + 1) >> 1;
+     }
+   else
+     {/* Use 16x Oversampling */
+       cr1 &= ~USART_CR1_OVER8;
+     }
+#endif //CONFIG_STM32_STM32F40XX
+
+   brr        = mantissa << USART_BRR_MANT_SHIFT;
    brr       |= fraction << USART_BRR_FRAC_SHIFT;
+   up_serialout(priv, STM32_USART_CR1_OFFSET, cr1);
    up_serialout(priv, STM32_USART_BRR_OFFSET, brr);
-#endif
+#endif //
 
   /* Configure parity mode */
 
-  regval  = up_serialin(priv, STM32_USART_CR1_OFFSET);
-  regval &= ~(USART_CR1_PCE|USART_CR1_PS);
+  cr1 &= ~(USART_CR1_PCE | USART_CR1_PS | USART_CR1_M);
 
   if (priv->parity == 1)       /* Odd parity */
     {
-      regval |= (USART_CR1_PCE|USART_CR1_PS);
+      cr1 |= (USART_CR1_PCE | USART_CR1_PS);
     }
   else if (priv->parity == 2)  /* Even parity */
     {
-      regval |= USART_CR1_PCE;
+      cr1 |= USART_CR1_PCE;
     }
 
-  up_serialout(priv, STM32_USART_CR1_OFFSET, regval);
+  /* Configure word length (parity uses one of configured bits)
+   *
+   * Default: 1 start, 8 data (no parity), n stop, OR
+   *          1 start, 7 data + parity, n stop
+   */
+
+  if (priv->bits == 9 || (priv->bits == 8 && priv->parity != 0))
+    {
+      /* Select: 1 start, 8 data + parity, n stop, OR
+       *         1 start, 9 data (no parity), n stop.
+       */
+
+      cr1 |= USART_CR1_M;
+    }
+
+  up_serialout(priv, STM32_USART_CR1_OFFSET, cr1);
 
   /* Configure STOP bits */
 
@@ -1284,7 +1347,7 @@ static void up_set_format(struct uart_dev_s *dev)
   regval  = up_serialin(priv, STM32_USART_CR3_OFFSET);
   regval &= ~(USART_CR3_CTSE|USART_CR3_RTSE);
 
-#ifdef CONFIG_SERIAL_IFLOWCONTROL
+#if defined(CONFIG_SERIAL_IFLOWCONTROL) && !defined(HWRTS_BROKEN)
   if (priv->iflow && (priv->rts_gpio != 0))
     {
       regval |= USART_CR3_RTSE;
@@ -1339,7 +1402,11 @@ static int up_setup(struct uart_dev_s *dev)
 #ifdef CONFIG_SERIAL_IFLOWCONTROL
   if (priv->rts_gpio != 0)
     {
-      stm32_configgpio(priv->rts_gpio);
+      uint32_t config = priv->rts_gpio;
+#ifdef HWRTS_BROKEN
+      config = (config & ~GPIO_MODE_MASK) | GPIO_OUTPUT; /* Instead of letting hw manage this pin, we will bitbang */
+#endif
+      stm32_configgpio(config);
     }
 #endif
 
@@ -1354,9 +1421,9 @@ static int up_setup(struct uart_dev_s *dev)
   /* Configure CR2 */
   /* Clear STOP, CLKEN, CPOL, CPHA, LBCL, and interrupt enable bits */
 
-  regval = up_serialin(priv, STM32_USART_CR2_OFFSET);
-  regval &= ~(USART_CR2_STOP_MASK|USART_CR2_CLKEN|USART_CR2_CPOL|
-              USART_CR2_CPHA|USART_CR2_LBCL|USART_CR2_LBDIE);
+  regval  = up_serialin(priv, STM32_USART_CR2_OFFSET);
+  regval &= ~(USART_CR2_STOP_MASK | USART_CR2_CLKEN | USART_CR2_CPOL |
+              USART_CR2_CPHA | USART_CR2_LBCL | USART_CR2_LBDIE);
 
   /* Configure STOP bits */
 
@@ -1368,17 +1435,10 @@ static int up_setup(struct uart_dev_s *dev)
   up_serialout(priv, STM32_USART_CR2_OFFSET, regval);
 
   /* Configure CR1 */
-  /* Clear M, TE, REm and all interrupt enable bits */
+  /* Clear TE, REm and all interrupt enable bits */
 
   regval  = up_serialin(priv, STM32_USART_CR1_OFFSET);
-  regval &= ~(USART_CR1_M|USART_CR1_TE|USART_CR1_RE|USART_CR1_ALLINTS);
-
-  /* Configure word length */
-
-  if (priv->bits == 9)         /* Default: 1 start, 8 data, n stop */
-    {
-      regval |= USART_CR1_M;   /* 1 start, 9 data, n stop */
-    }
+  regval &= ~(USART_CR1_TE | USART_CR1_RE | USART_CR1_ALLINTS);
 
   up_serialout(priv, STM32_USART_CR1_OFFSET, regval);
 
@@ -1386,7 +1446,7 @@ static int up_setup(struct uart_dev_s *dev)
   /* Clear CTSE, RTSE, and all interrupt enable bits */
 
   regval  = up_serialin(priv, STM32_USART_CR3_OFFSET);
-  regval &= ~(USART_CR3_CTSIE|USART_CR3_CTSE|USART_CR3_RTSE|USART_CR3_EIE);
+  regval &= ~(USART_CR3_CTSIE | USART_CR3_CTSE | USART_CR3_RTSE | USART_CR3_EIE);
 
   up_serialout(priv, STM32_USART_CR3_OFFSET, regval);
 
@@ -1397,7 +1457,7 @@ static int up_setup(struct uart_dev_s *dev)
   /* Enable Rx, Tx, and the USART */
 
   regval      = up_serialin(priv, STM32_USART_CR1_OFFSET);
-  regval     |= (USART_CR1_UE|USART_CR1_TE|USART_CR1_RE);
+  regval     |= (USART_CR1_UE | USART_CR1_TE | USART_CR1_RE);
   up_serialout(priv, STM32_USART_CR1_OFFSET, regval);
 
   /* Set up the cached interrupt enables value */
@@ -1489,7 +1549,7 @@ static void up_shutdown(struct uart_dev_s *dev)
   /* Disable Rx, Tx, and the UART */
 
   regval  = up_serialin(priv, STM32_USART_CR1_OFFSET);
-  regval &= ~(USART_CR1_UE|USART_CR1_TE|USART_CR1_RE);
+  regval &= ~(USART_CR1_UE | USART_CR1_TE | USART_CR1_RE);
   up_serialout(priv, STM32_USART_CR1_OFFSET, regval);
 }
 
@@ -1654,7 +1714,7 @@ static int up_interrupt_common(struct up_dev_s *priv)
             * RXNEIE:  We cannot call uart_recvchards of RX interrupts are disabled.
             */
 
-           uart_recvchars(&priv->dev);
+           up_recvchars(priv);
            handled = true;
         }
 
@@ -1968,7 +2028,7 @@ static void up_rxint(struct uart_dev_s *dev, bool enable)
 
 #ifndef CONFIG_SUPPRESS_SERIAL_INTS
 #ifdef CONFIG_USART_ERRINTS
-      ie |= (USART_CR1_RXNEIE|USART_CR1_PEIE|USART_CR3_EIE);
+      ie |= (USART_CR1_RXNEIE | USART_CR1_PEIE | USART_CR3_EIE);
 #else
       ie |= USART_CR1_RXNEIE;
 #endif
@@ -1976,7 +2036,7 @@ static void up_rxint(struct uart_dev_s *dev, bool enable)
     }
   else
     {
-      ie &= ~(USART_CR1_RXNEIE|USART_CR1_PEIE|USART_CR3_EIE);
+      ie &= ~(USART_CR1_RXNEIE | USART_CR1_PEIE | USART_CR3_EIE);
     }
 
   /* Then set the new interrupt state */
@@ -2251,7 +2311,7 @@ static void up_dma_rxcallback(DMA_HANDLE handle, uint8_t status, void *arg)
 
   if (priv->rxenable && up_dma_rxavailable(&priv->dev))
     {
-      uart_recvchars(&priv->dev);
+      up_recvchars(priv);
     }
 }
 #endif
@@ -2451,7 +2511,7 @@ void up_serialinit(void)
 
   for (i = 0; i < STM32_NUSART; i++)
     {
-        
+
 
       /* Don't create a device for non configured ports */
       if (uart_devs[i] == 0)
@@ -2550,6 +2610,74 @@ void stm32_serial_dma_poll(void)
 #endif
 
   irqrestore(flags);
+}
+#endif
+
+/****************************************************************************
+ * Name: up_recvchars
+ *
+ * Description:
+ *   This is a wrapper for the std uart_recvchars() function.  It adds support
+ * for manually asserting nRTS when the OS buffer is nearly full and deasserting
+ * it when it has more room.  This makes the RTS pin actually work in a useful
+ * way (the stm32 hw implementation is broken - it asserts nRTS as soon as
+ * more than one character is received)
+ *
+ ****************************************************************************/
+static void up_recvchars(struct up_dev_s *priv)
+{
+  uart_recvchars(&priv->dev);
+
+#ifdef HWRTS_BROKEN
+  if (priv->iflow && (priv->rts_gpio != 0))
+    {
+      // We've delivered the chars to the OS FIFO now update RTS state as needed
+      ssize_t numUsed = uart_numrxavail(&priv->dev);
+      uint8_t threshold = 16;
+      if (threshold > priv->dev.recv.size/4) {
+	threshold = priv->dev.recv.size/4;
+      }
+      // If we have less than 16 bytes left in the buffer then raise
+      // RTS to indicate the sender should stop sending
+      bool wantBackoff = (priv->dev.recv.size - numUsed < threshold);
+
+      if (wantBackoff)
+        stm32_gpiowrite(priv->rts_gpio, true); // high means please stop sending
+    }
+#endif
+}
+
+#ifdef HWRTS_BROKEN
+/****************************************************************************
+ * Name: up_onrxdeque
+ *
+ * Description:
+ *   This is a wrapper for the std uart_recvchars() function.  It adds support
+ * for manually asserting nRTS when the OS buffer is nearly full and deasserting
+ * it when it has more room.  This makes the RTS pin actually work in a useful
+ * way (the stm32 hw implementation is broken - it asserts nRTS as soon as
+ * more than one character is received)
+ *
+ ****************************************************************************/
+static void up_onrxdeque(struct uart_dev_s *dev)
+{
+  struct up_dev_s *priv = (struct up_dev_s*)dev->priv;
+
+  if (priv->iflow && (priv->rts_gpio != 0))
+    {
+      // We've delivered the chars to the OS FIFO now update RTS state as needed
+      ssize_t numUsed = uart_numrxavail(dev);
+      uint8_t threshold = 32;
+      if (threshold > priv->dev.recv.size/2) {
+	threshold = priv->dev.recv.size/2;
+      }
+      // If we have 32 bytes free in the buffer then we tell the
+      // sender they can resume
+      bool wantResume = (priv->dev.recv.size - numUsed >= threshold);
+
+      if(wantResume)
+        stm32_gpiowrite(priv->rts_gpio, false); // nRTS low means ready to recv
+    }
 }
 #endif
 
